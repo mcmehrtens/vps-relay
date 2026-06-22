@@ -1,0 +1,11 @@
+entryPoints:
+  minecraft:
+    address: ":25565"
+  # --- Future HTTPS services (PhotoPrism etc.), SNI-multiplexed on :443 ---
+  # websecure:
+  #   address: ":443"
+
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true

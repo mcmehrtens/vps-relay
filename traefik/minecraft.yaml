@@ -1,0 +1,12 @@
+tcp:
+  routers:
+    minecraft:
+      entryPoints:
+        - minecraft
+      rule: "HostSNI(`*`)"
+      service: minecraft
+  services:
+    minecraft:
+      loadBalancer:
+        servers:
+          - address: "100.102.3.49:25565"

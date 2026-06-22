@@ -1,0 +1,20 @@
+#cloud-config
+package_update: true
+packages:
+  - git
+  - ca-certificates
+
+write_files:
+  # Secrets staged outside the repo dir (write_files runs before the clone in
+  # runcmd; staging here avoids colliding with the not-yet-cloned directory).
+  - path: /root/relay.env
+    permissions: "0600"
+    content: |
+      TS_AUTHKEY_ADMIN=tskey-auth-REPLACE_ME
+      TS_AUTHKEY_RELAY=tskey-auth-REPLACE_ME
+
+runcmd:
+  - git clone https://github.com/mcmehrtens/vps-relay.git /root/vps-relay
+  - mv /root/relay.env /root/vps-relay/.env
+  - chmod 600 /root/vps-relay/.env
+  - bash /root/vps-relay/bootstrap.sh 2>&1 | tee /var/log/bootstrap.log

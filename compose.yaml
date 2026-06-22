@@ -1,0 +1,43 @@
+networks:
+  relaynet:
+    driver: bridge
+
+services:
+  traefik:
+    image: traefik:v3.7.5
+    container_name: traefik
+    networks:
+      - relaynet
+    ports:
+      - "25565:25565"
+    volumes:
+      - ./traefik.yaml:/etc/traefik/traefik.yaml:ro
+      - ./traefik:/etc/traefik/dynamic:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  tailscale-relay:
+    image: tailscale/tailscale:v1.98.4
+    container_name: tailscale-relay
+    network_mode: service:traefik
+    depends_on:
+      - traefik
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY_RELAY:?set TS_AUTHKEY_RELAY in .env}
+      - TS_USERSPACE=false
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_HOSTNAME=vps-relay-data
+      - TS_ACCEPT_DNS=false
+      - TS_AUTH_ONCE=true
+      - TS_EXTRA_ARGS=--advertise-tags=tag:vps-relay
+    volumes:
+      - ./tailscale-state:/var/lib/tailscale
+    restart: unless-stopped
