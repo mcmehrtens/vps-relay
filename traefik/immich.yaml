@@ -1,0 +1,14 @@
+tcp:
+  routers:
+    immich:
+      entryPoints:
+        - websecure
+      rule: "HostSNI(`photos.mehrtens.com`)"
+      tls:
+        passthrough: true
+      service: immich
+  services:
+    immich:
+      loadBalancer:
+        servers:
+          - address: "100.102.3.49:8443"
