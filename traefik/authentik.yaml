@@ -1,0 +1,16 @@
+tcp:
+  routers:
+    authentik:
+      entryPoints:
+        - websecure
+      rule: "HostSNI(`auth.mehrtens.com`)"
+      tls:
+        passthrough: true
+      service: authentik
+  services:
+    authentik:
+      loadBalancer:
+        proxyProtocol:
+          version: 2
+        servers:
+          - address: "100.102.3.49:8444"
