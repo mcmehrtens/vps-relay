@@ -9,4 +9,6 @@ tcp:
     minecraft:
       loadBalancer:
         servers:
-          - address: "100.102.3.49:25565"
+          # TEMP (NAS outage): mc-temp Linode hosts the server; revert to the
+          # NAS traefik node (100.102.3.49:25565) when the NAS returns.
+          - address: "100.84.68.42:25565"
