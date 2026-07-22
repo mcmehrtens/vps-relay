@@ -93,7 +93,17 @@ restore: an empty `data/` would generate a fresh world.
    `100.102.3.49:25565` → `<mc-temp-100.x>:25565`. Commit, push.
 3. **Relay:** `ssh root@vps-relay`, `cd /root/vps-relay && git pull`. Traefik's
    file provider (`watch: true`) hot-reloads — no restart.
-4. **Verify off-tailnet** (phone on cellular, Tailscale off):
+4. **Home DNS (OPNsense Unbound) — don't skip this.** `mc.mehrtens.com` has
+   split-horizon entries pointing at the NAS leg, which during the outage
+   *accepts TCP and then hangs* (the NAS-side `serve :25565` still listens but
+   its backend is stopped). In the tailnet view
+   (`/usr/local/etc/unbound.opnsense.d/tailnet-view.conf`) set
+   `mc.mehrtens.com → <mc-temp-100.x>`; in the GUI, **disable** the `mc` host
+   override (LAN clients then resolve publicly → relay). Then
+   `configctl unbound restart`. Symptom if forgotten: your own devices can't
+   join while off-tailnet players are fine — `dig mc.mehrtens.com +short`
+   from the failing device tells you instantly.
+5. **Verify off-tailnet** (phone on cellular, Tailscale off):
    `nc -zv mc.mehrtens.com 25565`, then a real join from both players.
 
 ---
@@ -120,7 +130,9 @@ restore: an empty `data/` would generate a fresh world.
    start the NAS minecraft, test over the tailnet.
 3. Revert the `traefik/minecraft.yaml` commit; push; `git pull` on the relay.
    Instant cutback, no DNS.
-4. Remove the `mc-temp` ACL grant + test line. **Delete the Linode** (billing
+4. Revert home DNS: tailnet view `mc.mehrtens.com → 100.102.3.49`, re-enable
+   the `mc` GUI host override (`10.0.0.22`), `configctl unbound restart`.
+5. Remove the `mc-temp` ACL grant + test line. **Delete the Linode** (billing
    stops; the ephemeral tailscale node self-prunes) and `mc-fw`. Keep this
    directory — it's the playbook for the next outage.
 
