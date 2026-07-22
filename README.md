@@ -95,6 +95,7 @@ only, with LISH as break-glass.
 | `traefik/authentik.yaml` | Dynamic TCP router (authentik, SNI passthrough, **PROXY v2 emit**) → NAS traefik node `:8444` |
 | `cloud-init.yaml`        | User-data: clone + inject secrets + run bootstrap (NOT committed; holds keys) |
 | `.env` / `.env.example`  | Two Tailscale auth keys (`.env` gitignored)                                   |
+| `mc-temp/`               | NAS-outage playbook: disposable Linode that hosts Minecraft itself while the NAS is down (see its README) |
 
 ---
 

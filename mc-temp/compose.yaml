@@ -1,0 +1,64 @@
+services:
+  minecraft:
+    image: itzg/minecraft-server:2026.7.2-java25
+    container_name: minecraft
+    environment:
+      - EULA=TRUE
+      - TZ=America/Chicago
+      # Keep the NAS UID/GID so the world round-trips home with ownership intact
+      - UID=3009
+      - GID=3009
+      - TYPE=PAPER
+      # Pinned to the exact NAS versions — no world upgrades while it's away
+      - VERSION=26.2
+      - PAPER_BUILD=65
+      # 5G (not the NAS's 6G): this box has 8G total and must also fit the
+      # JVM's ~1G non-heap overhead + OS/Docker/Tailscale. 5G is far more than
+      # Paper needs for 2 players; single-core speed is the bottleneck, not heap.
+      - MEMORY=5G
+      - DIFFICULTY=normal
+      - MOTD=mehrtens.com
+      - ENABLE_RCON=true
+      - RCON_PASSWORD=${RCON_PASSWORD:?set RCON_PASSWORD in .env}
+      - WHITELIST=mattrat9
+      - ENFORCE_WHITELIST=true
+      - OPS=mattrat9
+      - OP_PERMISSION_LEVEL=4
+      - ONLINE_MODE=true
+      - PAUSE_WHEN_EMPTY_SECONDS=60
+      - MAX_PLAYERS=5
+      - USE_AIKAR_FLAGS=true
+      - SPAWN_PROTECTION=0
+      - SEED=Apple
+    ports:
+      # Bound on all interfaces, but the cloud firewall (mc-fw) drops all
+      # public inbound — this is reachable only over the tailnet (the relay
+      # dials it, and tailnet clients can Direct Connect). RCON stays unpublished.
+      - "25565:25565"
+    volumes:
+      - ./data:/data
+    mem_limit: 6500m
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  backup:
+    image: itzg/mc-backup:2026.7.2
+    container_name: mc-backup
+    depends_on:
+      - minecraft
+    environment:
+      - TZ=America/Chicago
+      - BACKUP_INTERVAL=6h
+      - INITIAL_DELAY=2m
+      # Short retention sized to the 82G disk; pull a copy off-box weekly
+      # (see README). The NAS's ZFS safety net doesn't exist here.
+      - PRUNE_BACKUPS_DAYS=2
+      - RCON_HOST=minecraft
+      - RCON_PASSWORD=${RCON_PASSWORD:?set RCON_PASSWORD in .env}
+      # Skip redundant tars while the server sits empty/paused
+      - PAUSE_IF_NO_PLAYERS=true
+    volumes:
+      - ./data:/data:ro
+      - ./backups:/backups
+    restart: unless-stopped

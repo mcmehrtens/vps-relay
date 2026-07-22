@@ -1,3 +1,5 @@
 .env
 tailscale-state/
 *.log
+mc-temp/data/
+mc-temp/backups/
