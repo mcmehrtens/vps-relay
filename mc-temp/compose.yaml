@@ -11,7 +11,6 @@ services:
       - TYPE=PAPER
       # Pinned to the exact NAS versions — no world upgrades while it's away
       - VERSION=26.2
-      - PAPER_BUILD=65
       # 5G (not the NAS's 6G): this box has 8G total and must also fit the
       # JVM's ~1G non-heap overhead + OS/Docker/Tailscale. 5G is far more than
       # Paper needs for 2 players; single-core speed is the bottleneck, not heap.
