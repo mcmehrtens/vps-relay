@@ -1,5 +1,13 @@
 # mc-temp — temporary Minecraft host (NAS-outage playbook)
 
+**Status: cutback in progress (2026-08-29).** Activation 2026-07-22 →
+2026-08-29 (NAS hardware move). The world is home on the NAS and serving; the
+relay's Minecraft route is being repointed back at `100.102.3.49:25565`. The
+mc-temp Linode is **stopped but not yet deleted** — see Decommission below.
+This directory is kept as the playbook for the next outage: `compose.yaml`,
+`cloud-init.yaml`, and `bootstrap.sh` are ready to use as-is — only the pinned
+versions and the auth key need a look.
+
 A disposable Linode that hosts the Minecraft server itself while the NAS is
 down. The public face doesn't change: `mc.mehrtens.com` still resolves to the
 relay VPS, the relay's Traefik still listens on `:25565` — only the *backend*
@@ -108,7 +116,7 @@ restore: an empty `data/` would generate a fresh world.
 
 ---
 
-## Operate (the 3 weeks)
+## Operate (while it's live)
 
 - **Backups:** the `backup` sidecar tars `/data` every 6h (RCON-coordinated
   `save-off`/`save-on`), 2-day retention, skipped while nobody plays. Weekly,
@@ -122,19 +130,150 @@ restore: an empty `data/` would generate a fresh world.
 
 ## Cutback (NAS returns)
 
-1. Bring up the NAS stacks (tailscale-traefik, traefik — minecraft still
-   stopped). Announce downtime; `docker exec minecraft rcon-cli stop`, then
-   `docker compose down` here.
-2. Tar `data/`, copy home, replace the stale
-   `/mnt/tank/apps/minecraft/data` with it (ownership is already `3009:3009`),
-   start the NAS minecraft, test over the tailnet.
-3. Revert the `traefik/minecraft.yaml` commit; push; `git pull` on the relay.
-   Instant cutback, no DNS.
-4. Revert home DNS: tailnet view `mc.mehrtens.com → 100.102.3.49`, re-enable
-   the `mc` GUI host override (`10.0.0.22`), `configctl unbound restart`.
-5. Remove the `mc-temp` ACL grant + test line. **Delete the Linode** (billing
-   stops; the ephemeral tailscale node self-prunes) and `mc-fw`. Keep this
-   directory — it's the playbook for the next outage.
+Order matters: the world moves home and is **proven working on the NAS before**
+the relay repoints, so a bad restore never becomes public downtime. mc-temp
+keeps serving players right up until step 4 — nothing before it is
+time-critical, and every step before it is reversible by just restarting the
+mc-temp stack.
+
+### 1. Pre-flight (nothing stops yet)
+
+- NAS stacks up (`tailscale-traefik`, `traefik`), `minecraft` still **stopped**.
+- The NAS `compose.yaml` still pins what the world was frozen at — image
+  `itzg/minecraft-server:2026.7.2-java25`, `VERSION=26.2`, no stale
+  `PAPER_BUILD`. Same-or-newer is fine; **never older**: Paper refuses to open a
+  world a newer build has already touched, and there is no downgrade path.
+- Free space on `/mnt/tank` ≥ 3× world size (archive + extract + the stale copy
+  kept as a fallback).
+- Tailscale up on the Mac; `nas`, `traefik`, and `router` all online.
+
+### 2. Freeze and archive the world on mc-temp
+
+```
+ssh root@mc-temp
+  cd /root/vps-relay/mc-temp
+  docker exec minecraft rcon-cli list     # confirm nobody is mid-session
+  docker exec minecraft rcon-cli say "Server moving home — back in ~15 min"
+  docker compose down -t 120              # graceful stop; takes the sidecar too
+  docker ps -a                            # both containers gone
+  ls -la data/world/level.dat             # mtime = just now → the save landed
+  tar -cpf - data | xz -T0 -3 > minecraft-data-$(date +%F).tar.xz
+  sha256sum minecraft-data-*.tar.xz
+```
+
+**Use `compose down -t 120`, not `rcon-cli stop`.** With `restart:
+unless-stopped`, an rcon `stop` exits the JVM 0 and Docker immediately restarts
+the container — you get a *running* server and think you stopped it. `compose
+down` SIGTERMs `mc-server-runner`, which issues the in-game stop and waits for
+the save; `-t 120` keeps Docker's 10s default from SIGKILLing a large world
+mid-flush. Verify by `level.dat`'s mtime, not by the log tail — a restart
+interleaves shutdown-save lines and startup lines, which reads very confusingly.
+Never tar a running world.
+
+### 3. Carry it home (via the Mac, then to the NAS)
+
+Two hops instead of one on purpose: it leaves an off-box copy on the Mac, and
+it needs no mc-temp↔NAS ACL grant.
+
+```
+# on the Mac
+rsync -av --progress root@mc-temp:/root/vps-relay/mc-temp/minecraft-data-*.tar.xz ~/tmp/
+shasum -a 256 ~/tmp/minecraft-data-*.tar.xz     # must match step 2
+rsync -av --progress ~/tmp/minecraft-data-*.tar.xz <nas>:/mnt/tank/apps/minecraft/
+```
+
+### 4. Restore on the NAS, then flip the relay
+
+```
+# on the NAS, minecraft still stopped
+cd /mnt/tank/apps/minecraft
+mv data data.stale-$(date +%F)      # keep the pre-outage world as a fallback
+tar -xJpf minecraft-data-*.tar.xz   # archive carries the data/ prefix
+chown -R 3009:3009 data
+docker compose up -d minecraft
+docker compose logs -f minecraft    # wait for "Done"
+```
+
+Test it over the tailnet/LAN first — Direct Connect to `10.0.0.22:25565` — and
+actually walk around: spawn, both players' bases, a mob farm. Only then:
+
+1. Revert `traefik/minecraft.yaml` to `100.102.3.49:25565`; commit; push.
+2. `ssh root@vps-relay`, `cd /root/vps-relay && git pull`. Traefik's file
+   provider (`watch: true`) hot-reloads — no restart, no DNS change.
+3. Verify off-tailnet (phone on cellular, Tailscale off): `nc -zv
+   mc.mehrtens.com 25565`, then a **real join** — see the SLP gotcha below.
+
+Keep `data.stale-*` and the tarball until a full play session has gone by; drop
+the stale copy after.
+
+### 5. Revert home DNS (OPNsense)
+
+- Tailnet view (`/usr/local/etc/unbound.opnsense.d/tailnet-view.conf`):
+  `mc.mehrtens.com → 100.102.3.49`. Leave its `local-zone … static` line alone —
+  that's the AAAA suppression, not the address.
+- Re-enable the `mc` GUI host override (`10.0.0.22`), then `configctl unbound
+  restart`.
+- If the tailnet `mehrtens.com` split-DNS route was deleted during the outage
+  (a documented workaround below), re-add it → the `router` node
+  (`fd7a:115c:a1e0::6601:e460`).
+- Verify from three places: on the tailnet `dig mc.mehrtens.com +short` →
+  `100.102.3.49` and `dig AAAA` → NODATA; on the LAN → `10.0.0.22`;
+  off-tailnet → the relay's public IP.
+
+### 6. Decommission
+
+Only after a real play session on the NAS server has gone by.
+
+- Keep the final tarball on the Mac (plus `~/mc-temp-backups/`) — that's the
+  insurance that makes deleting the box safe.
+- **Delete the Linode** — billing only stops on delete; a powered-off instance
+  still bills. Then delete the `mc-fw` cloud firewall.
+- Tailnet ACL: remove the `hosts` alias `mc-temp`, the `tag:vps-relay →
+  mc-temp:25565` grant, the member rule, and the test lines. Keep every existing
+  deny and the `traefik-node` grants.
+- **Do not revoke `TS_AUTHKEY_ADMIN`** — the relay host shares that key.
+- Confirm `mc-temp` is gone from the Tailscale admin console (ephemeral nodes
+  self-prune) and from the Linode billing page.
+- Update the status banner at the top of this file.
+
+## Gotchas (all of these cost real time)
+
+- **A bare TCP connect proves nothing.** Traefik accepts on `:25565` before it
+  dials the backend, so `nc -zv` succeeds even when the server behind it is
+  dead. Symptom: "connects, then hangs." Always finish with a real
+  Server-List-Ping — the multiplayer list showing MOTD + player count — or an
+  actual join.
+- **Debug DNS first, always.** `dig mc.mehrtens.com +short` from the failing
+  device answers most "can't reach server" reports in one command. A stale `mc`
+  entry pointing at a down NAS leg is indistinguishable from a server problem
+  until you look.
+- **The tailnet split-DNS route for `mehrtens.com` points at the `router`
+  node.** If OPNsense is down — which it is during a whole-homelab outage —
+  every tailnet device with `accept-dns` fails to resolve *any* `mehrtens.com`
+  name, and Minecraft just says "can't reach server" while the server is
+  perfectly healthy. Workarounds while it's down: connect to the MagicDNS name
+  (`mc-temp.opah-alligator.ts.net`), or delete the `mehrtens.com` split-DNS
+  route so names fall through to public DNS → the relay. Re-add it at cutback.
+  Diagnose with `tailscale dns status` + `tailscale status`.
+- **AAAA leaks past the tailnet view.** The public names carry intentional AAAA
+  records (IPv6-only cellular). Without a per-name `local-zone … static` entry,
+  a dual-stack tailnet device resolves the AAAA and takes the public relay path
+  instead of the direct one. Any new name in the tailnet view needs *both* a
+  `local-zone … static` and a `local-data` line.
+
+- **Test the relay→NAS hop from inside the relay's netns, not from the relay
+  host.** They are two different tailnet nodes with different grants: the host
+  is `vps-relay` (`tag:vps-admin`), while the ACL grant belongs to
+  `vps-relay-data` (`tag:vps-relay`), which lives in the Traefik container's
+  network namespace (`network_mode: service:traefik`). A probe from the host —
+  or from your Mac — is ACL-denied and times out, which is indistinguishable
+  from a dead backend and will send you diagnosing the NAS for an hour. Test it
+  the way Traefik actually dials it:
+
+  ```
+  PID=$(docker inspect -f '{{.State.Pid}}' traefik)
+  nsenter -t $PID -n python3 - 100.102.3.49:25565   # SLP, not just a TCP connect
+  ```
 
 ## Test matrix
 
