@@ -1,12 +1,12 @@
 # mc-temp — temporary Minecraft host (NAS-outage playbook)
 
-**Status: cutback in progress (2026-08-29).** Activation 2026-07-22 →
-2026-08-29 (NAS hardware move). The world is home on the NAS and serving; the
-relay's Minecraft route is being repointed back at `100.102.3.49:25565`. The
-mc-temp Linode is **stopped but not yet deleted** — see Decommission below.
-This directory is kept as the playbook for the next outage: `compose.yaml`,
-`cloud-init.yaml`, and `bootstrap.sh` are ready to use as-is — only the pinned
-versions and the auth key need a look.
+**Status: dormant — nothing is deployed.** Last activation 2026-07-22 →
+2026-08-29 (NAS hardware move): Minecraft ran on a temporary Chicago Linode
+while the NAS was down, then came home. The Linode and the `mc-fw` firewall are
+deleted and the `mc-temp` ACL entries are removed; the relay's Minecraft route
+points at `100.102.3.49:25565` again. This directory is kept as the playbook
+for the next outage: `compose.yaml`, `cloud-init.yaml`, and `bootstrap.sh` are
+ready to use as-is — only the pinned versions and the auth key need a look.
 
 A disposable Linode that hosts the Minecraft server itself while the NAS is
 down. The public face doesn't change: `mc.mehrtens.com` still resolves to the
@@ -246,7 +246,17 @@ Only after a real play session on the NAS server has gone by.
 - **Debug DNS first, always.** `dig mc.mehrtens.com +short` from the failing
   device answers most "can't reach server" reports in one command. A stale `mc`
   entry pointing at a down NAS leg is indistinguishable from a server problem
-  until you look.
+  until you look. But from inside the LAN you cannot see the *public* answer:
+  OPNsense NAT-redirects outbound `:53`, so even `dig @1.1.1.1` is answered by
+  Unbound's LAN view — during cutback that returned `10.0.0.22` and looked like
+  a private address had leaked into public DNS. The tell is `dig @1.1.1.1 CH TXT
+  id.server` coming back empty. Get the real answer over DoH, which uses `:443`
+  and can't be intercepted:
+
+  ```
+  curl -s -H 'accept: application/dns-json' \
+    'https://cloudflare-dns.com/dns-query?name=mc.mehrtens.com&type=A'
+  ```
 - **The tailnet split-DNS route for `mehrtens.com` points at the `router`
   node.** If OPNsense is down — which it is during a whole-homelab outage —
   every tailnet device with `accept-dns` fails to resolve *any* `mehrtens.com`
