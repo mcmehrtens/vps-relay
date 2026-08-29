@@ -4,7 +4,7 @@ networks:
 
 services:
   traefik:
-    image: traefik:v3.7.8
+    image: traefik:v3.7.12
     container_name: traefik
     networks:
       - relaynet
@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
 
   tailscale-relay:
-    image: tailscale/tailscale:v1.98.9
+    image: tailscale/tailscale:v1.102.3
     container_name: tailscale-relay
     network_mode: service:traefik
     depends_on:
