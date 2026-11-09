@@ -2,55 +2,89 @@
 # One-command maintenance for the relay VPS.
 #
 #   From your laptop (repo checkout):   ./update.sh [--no-reboot]
-#   Re-attach to a running/last run:    ./update.sh --follow
+#   Re-attach to a running/last run:    ./update.sh --follow   (alias --attach)
+#   One-shot result + health check:     ./update.sh --status
 #   (Run on the box itself, the same commands work in /root/vps-relay.)
 #
 # What a run does, on the box, as root:
 #   1. apt full-upgrade: Debian, Docker engine, host Tailscale; autoremove
 #   2. git pull --ff-only, then docker compose pull + up -d (pinned image bumps)
-#   3. prune dangling images
+#   3. prune images no container uses (old pinned versions)
 #   4. reboot if a newer kernel / reboot-required is pending (unless --no-reboot)
 #
 # Why it's shaped like this: admin access is Tailscale SSH, served by the very
 # tailscaled that apt may upgrade. Restarting tailscaled drops every SSH session
 # and can kill whatever runs inside it -- including a half-finished dpkg. So the
 # real work runs in a transient systemd unit (its own cgroup, unaffected by the
-# session dying) that writes to $LOG; the SSH session only follows that log.
-# From the laptop, a dropped connection is retried until the run -- and any
-# reboot it triggers -- has finished.
+# session dying) that writes to $LOG; the SSH session only streams that log.
+#
+# The laptop side never trusts how a streaming session ended (a session killed
+# by tailscaled restarting or the box shutting down exits with an arbitrary
+# code). After every stream it asks the box for --status, retrying through
+# drops and reboots until the box reports the run finished AND healthy.
 set -euo pipefail
 
 UNIT=vps-relay-update
 LOG=/var/log/vps-relay-update.log
 HOST=${VPS_HOST:-root@vps-relay}
 REMOTE_SCRIPT=/root/vps-relay/update.sh
+WAIT_LIMIT=900 # seconds the laptop waits for the box to come back healthy
+
+# --status exit codes (box side)
+ST_OK=0 ST_FAILED=1 ST_RUNNING=3 ST_NOT_READY=4
 
 usage() {
     sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-### Laptop side: ssh in, and keep reconnecting across tailscaled restarts/reboots ###
+### Laptop side ###
 client() {
     local opts=(-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
-    ssh "${opts[@]}" "$HOST" true || { echo "cannot reach $HOST" >&2; exit 1; }
-    if [[ -t 0 ]]; then opts+=(-t); fi
+    local stream_opts=("${opts[@]}")
+    if [[ -t 0 ]]; then stream_opts+=(-t); fi
+    local stream=() rc
 
-    local rc=0 tries=0
-    ssh "${opts[@]}" "$HOST" "$REMOTE_SCRIPT" "$@" || rc=$?
-    # 255 = connection dropped (tailscaled restarted, or box rebooting)
-    #   3 = run finished and the box is about to reboot
-    while [[ $rc -eq 255 || $rc -eq 3 ]]; do
-        tries=$((tries + 1))
-        if [[ $tries -gt 60 ]]; then
-            echo "giving up after $tries reconnects; check later with ./update.sh --follow" >&2
+    case ${1:-} in
+        "" | --no-reboot)
+            # Refresh the box's checkout first so this run uses the current script.
+            if ! ssh "${opts[@]}" "$HOST" "git -C ${REMOTE_SCRIPT%/*} pull --ff-only -q"; then
+                echo "cannot reach $HOST (or git pull failed there)" >&2
+                exit 1
+            fi
+            stream=(--start-stream "$@")
+            ;;
+        --follow | --attach | -f) stream=(--stream) ;;
+        --status) ;;
+        *) usage >&2; exit 2 ;;
+    esac
+
+    local waited_since=$SECONDS
+    while :; do
+        if [[ ${#stream[@]} -gt 0 ]]; then
+            rc=0
+            ssh "${stream_opts[@]}" "$HOST" "$REMOTE_SCRIPT" "${stream[@]}" || rc=$?
+            if [[ $rc -eq 130 ]]; then
+                echo "detached -- the update keeps running; re-attach with: ./update.sh --follow"
+                exit 0
+            fi
+            stream=()
+        fi
+
+        rc=0
+        ssh "${opts[@]}" -o BatchMode=yes "$HOST" "$REMOTE_SCRIPT" --status 2>/dev/null || rc=$?
+        case $rc in
+            "$ST_OK" | "$ST_FAILED" | 2) exit "$rc" ;;
+            "$ST_RUNNING") stream=(--stream); waited_since=$SECONDS; continue ;;
+            "$ST_NOT_READY") ;;
+            255) echo "--- $HOST unreachable (tailscaled restart or reboot) ---" ;;
+            *) echo "--- unexpected status $rc from $HOST ---" ;;
+        esac
+        if [[ $((SECONDS - waited_since)) -ge $WAIT_LIMIT ]]; then
+            echo "gave up after ${WAIT_LIMIT}s -- check later with: ./update.sh --status" >&2
             exit 1
         fi
-        echo "--- disconnected (tailscaled restart or reboot); reconnecting in 10s ---"
         sleep 10
-        rc=0
-        ssh "${opts[@]}" "$HOST" "$REMOTE_SCRIPT" --follow || rc=$?
     done
-    exit "$rc"
 }
 
 ### Box side ###
@@ -63,68 +97,109 @@ reboot_needed() {
     [[ -n $newest && $newest != "$(uname -r)" ]]
 }
 
+# Prints problems; returns non-zero if the relay isn't fully up.
+health() {
+    local bad=0 c state
+    state=$(systemctl is-system-running 2>/dev/null || true)
+    case $state in
+        running) ;;
+        degraded) echo "system degraded -- failed units: $(systemctl --failed --no-legend --plain | awk '{print $1}' | xargs)" ;;
+        *) echo "system state: $state"; bad=1 ;;
+    esac
+    for c in traefik tailscale-relay; do
+        if [[ $(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null) != true ]]; then
+            echo "container $c not running"
+            bad=1
+        fi
+    done
+    if ! docker exec tailscale-relay tailscale status --peers=false >/dev/null 2>&1; then
+        echo "relay Tailscale (vps-relay-data) not connected"
+        bad=1
+    fi
+    return "$bad"
+}
+
 summary() {
     echo "kernel:    $(uname -r)  (up since $(uptime -s))"
     echo "tailscale: $(tailscale version | head -n1)"
     docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
 }
 
-# Exit codes: 0 ok, 1 failed/unknown, 3 reboot pending (laptop keeps waiting).
-verdict() {
-    local result
+# Exit codes: ST_OK, ST_FAILED, ST_RUNNING, ST_NOT_READY (rebooting / coming up).
+status() {
+    if systemctl is-active --quiet "$UNIT"; then
+        echo "update still running"
+        return "$ST_RUNNING"
+    fi
+    if [[ ! -f $LOG ]]; then
+        echo "no update log at $LOG"
+        return "$ST_FAILED"
+    fi
+
+    local result problems
     result=$(grep '^==> RESULT: ' "$LOG" | tail -n1 || true)
     case $result in
-        *"RESULT: ok"*)
-            summary
-            ;;
+        *"RESULT: ok"*) ;;
         *"RESULT: reboot"*)
             if [[ $(stat -c %Y "$LOG") -ge $(date -d "$(uptime -s)" +%s) ]]; then
-                echo "rebooting -- not back up yet"
-                return 3
+                echo "--- rebooting ---"
+                return "$ST_NOT_READY"
             fi
-            echo "rebooted."
-            summary
             ;;
         *"RESULT: failed"*)
-            echo "update FAILED -- full log: $LOG (previous run: $LOG.prev)" >&2
-            return 1
+            echo "update FAILED -- full log: $LOG (previous run: $LOG.prev)"
+            return "$ST_FAILED"
             ;;
         *)
-            echo "run ended without a result -- see: journalctl -u $UNIT" >&2
-            return 1
+            echo "run ended without a result -- see: journalctl -u $UNIT"
+            return "$ST_FAILED"
             ;;
     esac
+
+    if ! problems=$(health); then
+        if [[ $(cut -d. -f1 /proc/uptime) -lt 300 ]]; then
+            echo "--- up $(cut -d. -f1 /proc/uptime)s, still coming up: $(echo "$problems" | paste -sd ';' -) ---"
+            return "$ST_NOT_READY"
+        fi
+        echo "UNHEALTHY after update:"
+        echo "$problems"
+        summary
+        return "$ST_FAILED"
+    fi
+    [[ $result == *reboot* ]] && echo "rebooted."
+    [[ -n $problems ]] && echo "WARNING: $problems"
+    echo "update OK, relay healthy."
+    summary
+    return "$ST_OK"
 }
 
-follow() {
+# Stream the log until the run ends. Ctrl-C exits 130 (= detach).
+stream() {
+    trap 'exit 130' INT
     if systemctl is-active --quiet "$UNIT"; then
-        tail -n 20 -F "$LOG" 2>/dev/null &
+        tail -n 20 -F --pid=$$ "$LOG" 2>/dev/null &
         local tail_pid=$!
+        trap 'kill "$tail_pid" 2>/dev/null; exit 130' INT
         while systemctl is-active --quiet "$UNIT"; do sleep 2; done
         sleep 1
         kill "$tail_pid" 2>/dev/null || true
     elif [[ -f $LOG ]]; then
         tail -n 20 "$LOG"
-    else
-        echo "no update log at $LOG" >&2
-        return 1
     fi
-    verdict
 }
 
 start() {
     if systemctl is-active --quiet "$UNIT"; then
         echo "an update is already running -- following it"
-        follow
-        return
+    else
+        if [[ -f $LOG ]]; then mv -f "$LOG" "$LOG.prev"; fi
+        systemd-run --unit="$UNIT" --collect --quiet \
+            --setenv=HOME=/root \
+            -p StandardOutput="append:$LOG" -p StandardError="append:$LOG" \
+            "$SELF" --run "$@"
+        echo "started $UNIT -- it keeps running if this session drops (Ctrl-C only detaches)"
     fi
-    if [[ -f $LOG ]]; then mv -f "$LOG" "$LOG.prev"; fi
-    systemd-run --unit="$UNIT" --collect --quiet \
-        --setenv=HOME=/root \
-        -p StandardOutput="append:$LOG" -p StandardError="append:$LOG" \
-        "$SELF" --run "$@"
-    echo "started $UNIT -- it keeps running if this session drops (Ctrl-C only detaches)"
-    follow
+    stream
 }
 
 run() {
@@ -153,8 +228,8 @@ run() {
 
     log "docker compose pull + up"
     (cd "$DIR" && docker compose pull && docker compose up -d)
-    log "prune dangling images"
-    docker image prune -f
+    log "prune images not used by a container (old pinned versions)"
+    docker image prune -af
 
     if reboot_needed; then
         if [[ $reboot -eq 1 ]]; then
@@ -183,7 +258,10 @@ DIR=$(dirname "$SELF")
 
 case ${1:-} in
     --run) shift; run "$@" ;;
-    --follow | -f) follow ;;
-    "" | --no-reboot) start "$@" ;;
+    --start-stream) shift; start "$@" ;;      # laptop-side helpers
+    --stream) stream ;;
+    --status) status ;;
+    --follow | --attach | -f) stream; status ;;
+    "" | --no-reboot) start "$@"; status ;;
     *) usage >&2; exit 2 ;;
 esac

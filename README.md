@@ -209,12 +209,13 @@ From a repo checkout on your laptop:
 ```
 ./update.sh              # upgrade everything; reboot only if one is pending
 ./update.sh --no-reboot  # same, but leave the reboot to you
-./update.sh --follow     # re-attach to the current run, or show how the last one ended
+./update.sh --follow     # re-attach to the current run (alias --attach)
+./update.sh --status     # wait for a definitive result + health check
 ```
 
 It SSHes to `root@vps-relay` (override with `VPS_HOST=...`) and runs
 `/root/vps-relay/update.sh` there, which: `apt full-upgrade` + autoremove →
-`git pull --ff-only` → `docker compose pull && up -d` → `docker image prune` →
+`git pull --ff-only` → `docker compose pull && up -d` → `docker image prune -a` →
 reboot if `/run/reboot-required` exists or a newer kernel is installed.
 
 **Why it survives the SSH drop.** Admin SSH *is* `tailscaled`, and apt may
@@ -222,15 +223,24 @@ upgrade it. When `tailscaled` restarts, every session drops and anything running
 inside it can be killed too, including a half-finished `dpkg`. So the work runs in
 a transient systemd unit (`vps-relay-update`, its own cgroup) that logs to
 `/var/log/vps-relay-update.log` (previous run: `.log.prev`); the SSH session only
-tails that log. The laptop side reconnects after a drop and keeps waiting through
-a reboot, then prints kernel, Tailscale version and container status. Ctrl-C only
+tails that log.
+
+**How it knows it's done.** How a streaming session ends proves nothing: a
+session killed by a `tailscaled` restart or by shutdown exits with an arbitrary
+code. So after every stream the laptop side asks the box for `--status`, and
+retries through drops and the reboot (up to 15 min) until the box reports a
+result. Success means the run's result is `ok` (or it rebooted, and this boot is
+newer than that result), the system is `running`, both containers are up, and the
+relay's Tailscale node is connected. Unhealthy within 5 min of boot counts as
+"still coming up"; after that it's a failure. Ctrl-C while streaming only
 detaches; the run keeps going.
 
 Expect a short outage of all three services: the Docker engine upgrade restarts
-the containers, and a reboot takes about a minute.
+the containers, a `tailscaled` restart takes the admin path away for a minute or
+two, and a reboot takes about 2–3 minutes.
 
-Before the first run, `git pull` on the box once so that `update.sh` exists there.
-After that, every run pulls the repo itself.
+Each start runs `git pull` on the box *before* launching, so the run always uses
+the script you just pushed.
 
 ## Manual bootstrap (on a live box)
 
