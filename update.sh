@@ -256,12 +256,24 @@ fi
 SELF=$(readlink -f "$0")
 DIR=$(dirname "$SELF")
 
-case ${1:-} in
-    --run) shift; run "$@" ;;
-    --start-stream) shift; start "$@" ;;      # laptop-side helpers
+reject() { echo "unexpected arguments: $*" >&2; usage >&2; exit 2; }
+
+# Strict args: wrappers (e.g. Ghostty's ssh integration) have been seen appending
+# their own words to the remote command, which must never start a run.
+cmd=${1:-}
+if [[ $# -gt 0 ]]; then shift; fi
+case $cmd in
+    --run | --start-stream | "" | --no-reboot)
+        for arg in "$@"; do [[ $arg == --no-reboot ]] || reject "$cmd" "$@"; done ;;
+    *) [[ $# -eq 0 ]] || reject "$cmd" "$@" ;;
+esac
+case $cmd in
+    --run) run "$@" ;;
+    --start-stream) start "$@" ;; # laptop-side helpers
     --stream) stream ;;
     --status) status ;;
     --follow | --attach | -f) stream; status ;;
-    "" | --no-reboot) start "$@"; status ;;
-    *) usage >&2; exit 2 ;;
+    "") start; status ;;
+    --no-reboot) start --no-reboot; status ;;
+    *) reject "$cmd" ;;
 esac
