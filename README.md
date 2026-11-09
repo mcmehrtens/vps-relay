@@ -88,6 +88,7 @@ only, with LISH as break-glass.
 | File                     | Purpose                                                                       |
 | ------------------------ | ----------------------------------------------------------------------------- |
 | `bootstrap.sh`           | Idempotent host setup: hardening, Docker, host TS, stack                      |
+| `update.sh`              | One-command maintenance: apt upgrade, image bumps, reboot if needed (see **Updates**) |
 | `compose.yaml`           | Traefik + tagged Tailscale relay container                                    |
 | `traefik.yaml`           | Static config: `:25565` + `:443` entrypoints, file provider                   |
 | `traefik/minecraft.yaml` | Dynamic TCP router (Minecraft) → NAS traefik node `:25565`                    |
@@ -186,6 +187,50 @@ A plain reboot does **not** re-run cloud-init. Containers return via
 `restart: unless-stopped`; the host Tailscale node and the relay container
 re-auth from persisted state. Expect a few seconds of Traefik dial errors
 before the tailnet comes up, then steady state. Nothing to do.
+
+## Updates
+
+### What's automatic
+
+| Component                         | Updated by                                       | Restart / reboot      |
+| --------------------------------- | ------------------------------------------------ | --------------------- |
+| Debian packages (stable + security) | `unattended-upgrades`, daily                   | **No auto-reboot**    |
+| Host Tailscale (`tailscaled`)     | Tailscale's own auto-update (`AutoUpdate.Apply`) | restarts `tailscaled` |
+| Docker engine (`docker-ce`, compose plugin) | **nothing**: third-party repo, not in the unattended origins | — |
+| Traefik / relay Tailscale images  | **nothing**: pinned in `compose.yaml`, bumped by commit | — |
+
+So kernel updates get *installed* but never *booted*, and the Docker engine and
+container images only move when you act.
+
+### The one command
+
+From a repo checkout on your laptop:
+
+```
+./update.sh              # upgrade everything; reboot only if one is pending
+./update.sh --no-reboot  # same, but leave the reboot to you
+./update.sh --follow     # re-attach to the current run, or show how the last one ended
+```
+
+It SSHes to `root@vps-relay` (override with `VPS_HOST=...`) and runs
+`/root/vps-relay/update.sh` there, which: `apt full-upgrade` + autoremove →
+`git pull --ff-only` → `docker compose pull && up -d` → `docker image prune` →
+reboot if `/run/reboot-required` exists or a newer kernel is installed.
+
+**Why it survives the SSH drop.** Admin SSH *is* `tailscaled`, and apt may
+upgrade it. When `tailscaled` restarts, every session drops and anything running
+inside it can be killed too, including a half-finished `dpkg`. So the work runs in
+a transient systemd unit (`vps-relay-update`, its own cgroup) that logs to
+`/var/log/vps-relay-update.log` (previous run: `.log.prev`); the SSH session only
+tails that log. The laptop side reconnects after a drop and keeps waiting through
+a reboot, then prints kernel, Tailscale version and container status. Ctrl-C only
+detaches; the run keeps going.
+
+Expect a short outage of all three services: the Docker engine upgrade restarts
+the containers, and a reboot takes about a minute.
+
+Before the first run, `git pull` on the box once so that `update.sh` exists there.
+After that, every run pulls the repo itself.
 
 ## Manual bootstrap (on a live box)
 
