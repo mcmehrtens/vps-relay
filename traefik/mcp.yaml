@@ -1,0 +1,27 @@
+tcp:
+  routers:
+    mcp:
+      entryPoints:
+        - websecure
+      rule: "HostSNI(`mcp.mehrtens.com`)"
+      tls:
+        passthrough: true
+      middlewares:
+        - anthropic-only
+      service: mcp
+  middlewares:
+    # Claude calls connectors only from Anthropic's published outbound ranges
+    # (IPv4 only): https://platform.claude.com/docs/en/api/ip-addresses
+    # Anyone else is dropped here at L4, before reaching the tailnet.
+    anthropic-only:
+      ipAllowList:
+        sourceRange:
+          - "160.79.104.0/21"
+          - "153.61.208.0/20"
+  services:
+    mcp:
+      loadBalancer:
+        proxyProtocol:
+          version: 2
+        servers:
+          - address: "100.102.3.49:8445"
