@@ -2,10 +2,11 @@
 
 Infrastructure-as-code for a locked-down public-facing relay VPS. A bare Linode
 (Debian, Chicago) runs Traefik + a tagged Tailscale node and reverse-proxies
-public traffic into home services over the tailnet. Three services today: a
-public **Minecraft Java** server, **Immich** (`photos.mehrtens.com`), and the
+public traffic into home services over the tailnet. Four services today: a
+public **Minecraft Java** server, **Immich** (`photos.mehrtens.com`), the
 **authentik** IdP (`auth.mehrtens.com`) that backs Immich's OIDC login for
-off-tailnet users — all hosted on the home NAS.
+off-tailnet users, and an **iCloud MCP** connector (`mcp.mehrtens.com`) that only
+Claude's servers may reach — all hosted on the home NAS.
 
 The box is disposable: everything here reproduces it from scratch. Secrets live
 only in `.env` (gitignored) and in the Linode user-data field — never in git.
@@ -49,6 +50,22 @@ browser (off-tailnet)
   → authentik server:9000  ← TLS terminates HERE, on the NAS, with the LE cert
 ```
 
+**iCloud MCP** (TLS passthrough, SNI-routed, PROXY v2, **Anthropic-only at L4**):
+
+```
+Claude (Anthropic's servers, 160.79.104.0/21 + 153.61.208.0/20)
+  → mcp.mehrtens.com  (Cloudflare A/AAAA → VPS public IP, grey cloud)
+  → VPS Traefik :443  (TCP, HostSNI(`mcp.mehrtens.com`), tls.passthrough,
+       TCP ipAllowList: anyone else is dropped here)
+       VPS TCP service prepends PROXY v2 header
+  → tailnet dial → 100.102.3.49:8445  (NAS traefik node, tag:home-infra)
+  → NAS tailscale serve --tcp=8445 (transparent pipe, NO --proxy-protocol)
+  → NAS Traefik :8445 ("public-mcp" entrypoint, parses PROXY v2,
+       HTTP ipAllowList on the real client IP + rate limit)
+  → mcp-gateway:3000 (agentgateway: authentik JWT + per-tool allowlist)
+  → icloud-mcp:8000 (internal-only network)
+```
+
 authentik is the third SNI-routed HTTPS service, and the first to use the
 **PROXY protocol** chain: the VPS emits a PROXY v2 header on its TCP service, the
 plain `tailscale serve --tcp` passes it through untouched, and the NAS
@@ -59,26 +76,26 @@ can be added to them later — Minecraft additionally needs a PROXY-aware server
 (Paper) to consume it. See **HTTPS services** below for the full mechanism and
 the one rule that matters (serve must stay a transparent pipe).
 
-The three never interact: Minecraft on its own `:25565` entrypoint with
-`HostSNI(*)`, Immich and authentik on the shared `:443` entrypoint matched by
-exact SNI to separate NAS backend ports (`:8443` Immich, `:8444` authentik). The
-public port for both HTTPS services is **`:443`**; `:8443`/`:8444` are only the
-NAS-side backends the relay dials over the tailnet — they never appear in a URL
-or a firewall rule.
+The four never interact: Minecraft on its own `:25565` entrypoint with
+`HostSNI(*)`, Immich, authentik and the MCP connector on the shared `:443`
+entrypoint matched by exact SNI to separate NAS backend ports (`:8443` Immich,
+`:8444` authentik, `:8445` MCP). The public port for all HTTPS services is
+**`:443`**; `:8443`–`:8445` are only the NAS-side backends the relay dials over
+the tailnet — they never appear in a URL or a firewall rule.
 
-**Security model.** The VPS is treated as hostile. It can reach exactly three
+**Security model.** The VPS is treated as hostile. It can reach exactly four
 ports on one home tailnet node — `traefik-node:25565` (Minecraft),
-`traefik-node:8443` (Immich), and `traefik-node:8444` (authentik) — and nothing
-else, enforced by a port-scoped Tailscale ACL, machine-checked on every policy
+`traefik-node:8443` (Immich), `traefik-node:8444` (authentik), and
+`traefik-node:8445` (MCP) — and nothing else, enforced by a port-scoped Tailscale ACL, machine-checked on every policy
 save. It never terminates TLS (Immich/authentik pass through by SNI; Minecraft is
 raw TCP), so a compromised relay holds no keys and can read no traffic. On the
-NAS side, `:8443` and `:8444` are dedicated Traefik entrypoints that each serve
+NAS side, `:8443`–`:8445` are dedicated Traefik entrypoints that each serve
 **one app only** (entrypoint scoping), so even a forged-SNI request can't reach
 `watch`/the dashboard — a second, independent layer beneath the ACL. authentik
 adds a third guard: its **public** router 403s `/if/admin` (the admin UI is
 reachable only over the tailnet/LAN). The PROXY-protocol parse on the NAS side
-trusts loopback only (`127.0.0.1`), which is safe because `:8444` is reachable
-solely via `serve` over loopback — never widen it, and never enable PROXY parsing
+trusts loopback only (`127.0.0.1`), which is safe because `:8444`/`:8445` are
+reachable solely via `serve` over loopback — never widen it, and never enable PROXY parsing
 on the VPS's public `:443` (the VPS only *emits*; parsing there would allow IP
 forgery). The host's `sshd` is purged; admin is Tailscale SSH (`tag:vps-admin`)
 only, with LISH as break-glass.
@@ -94,6 +111,7 @@ only, with LISH as break-glass.
 | `traefik/minecraft.yaml` | Dynamic TCP router (Minecraft) → NAS traefik node `:25565`                    |
 | `traefik/immich.yaml`    | Dynamic TCP router (Immich, SNI passthrough) → NAS traefik node `:8443`       |
 | `traefik/authentik.yaml` | Dynamic TCP router (authentik, SNI passthrough, **PROXY v2 emit**) → NAS traefik node `:8444` |
+| `traefik/mcp.yaml`       | Dynamic TCP router (iCloud MCP, SNI passthrough, **Anthropic-only allowlist**, PROXY v2 emit) → NAS traefik node `:8445` |
 | `cloud-init.yaml`        | User-data: clone + inject secrets + run bootstrap (NOT committed; holds keys) |
 | `.env` / `.env.example`  | Two Tailscale auth keys (`.env` gitignored)                                   |
 | `mc-temp/`               | NAS-outage playbook (**dormant**): disposable Linode that hosts Minecraft itself while the NAS is down (see its README) |
@@ -118,7 +136,7 @@ Reusable so rebuilds re-auth without minting new keys; ephemeral so destroyed
 nodes self-prune; pre-approved so a node never stalls awaiting manual approval.
 
 The matching ACL must already grant `tag:vps-relay → traefik-node:25565`,
-`traefik-node:8443`, and `traefik-node:8444` and nothing else (the data-plane
+`traefik-node:8443`, `traefik-node:8444`, and `traefik-node:8445` and nothing else (the data-plane
 lockdown). The tailnet policy lives separately from this repo.
 
 ### 2. Cloud Firewall `relay-fw`
@@ -266,8 +284,8 @@ the live box (fast iteration loop).
 4. Add inbound `accept-inbound-minecraft`: TCP `25565`, sources
    `0.0.0.0/0` + `::/0`, Accept.
 5. Add inbound `accept-inbound-https`: TCP `443`, sources `0.0.0.0/0` + `::/0`,
-   Accept. (Public port for **both** Immich and authentik — they share `:443`,
-   separated by SNI. The NAS-side `:8443`/`:8444` backends are reached over the
+   Accept. (Public port for Immich, authentik and MCP — they share `:443`,
+   separated by SNI. The NAS-side `:8443`–`:8445` backends are reached over the
    tailnet and are **not** firewall rules.)
 6. Default inbound **Drop**; default outbound **Accept** (relay needs egress
    for Tailscale coordination/DERP + the tailnet dial).
@@ -285,16 +303,21 @@ Cloudflare A records, zone `mehrtens.com`:
 | `mc`     | A    | VPS public IP | **DNS only** (grey cloud) |
 | `photos` | A    | VPS public IP | **DNS only** (grey cloud) |
 | `auth`   | A    | VPS public IP | **DNS only** (grey cloud) |
+| `mcp`    | A    | VPS public IP | **DNS only** (grey cloud) |
 
-**Grey cloud is mandatory for all three.** Cloudflare's proxy only handles
+`auth` and `mcp` also have AAAA records → the VPS's public IPv6; the relay serves
+IPv6 (verified 2026-11-13). Anthropic has no outbound IPv6 range, so Claude
+always reaches `mcp` over IPv4 and the allowlist drops any IPv6 client.
+
+**Grey cloud is mandatory for all of them.** Cloudflare's proxy only handles
 HTTP/HTTPS, so it cannot proxy Minecraft's raw TCP on :25565 at all. For Immich
 and authentik the reason differs but the answer is the same: the design is
 end-to-end TLS **passthrough** with the cert living on the NAS and the VPS
 holding nothing — orange cloud would terminate TLS at Cloudflare's edge and break
 that chain (and, for authentik, would also break the PROXY-protocol client-IP
 chain). So all stay DNS-only, returning the real VPS IP and stepping out of the
-path. IPv4 only; no AAAA unless the Linode has confirmed public IPv6 that
-`relay-fw` passes on the relevant ports.
+path. Add an AAAA only for a service that should be reachable over IPv6 (the
+Linode's public IPv6 and `relay-fw`'s `::/0` rules already work).
 
 ### Resolution paths (the three legs)
 
@@ -323,7 +346,8 @@ by the VPS, never by tailnet/LAN clients.
 
 A **Rebuild** keeps the IP. A full **destroy/recreate** assigns a NEW public IP:
 
-- Update **all three** Cloudflare A records (`mc`, `photos`, `auth`) to the new IP.
+- Update **all** Cloudflare A records (`mc`, `photos`, `auth`, `mcp`) and the
+  AAAA records (`auth`, `mcp`) to the new IPs.
 - Unbound tailnet/LAN entries are unaffected (they point at NAS nodes).
 
 ---
@@ -345,6 +369,8 @@ curl -sI https://photos.mehrtens.com/   # → HTTP/2 200 (full passthrough chain
 dig auth.mehrtens.com +short      # → VPS public IP
 curl -sI https://auth.mehrtens.com/        # → HTTP/2 302 into the flow (LE cert, PROXY chain OK)
 curl -sI https://auth.mehrtens.com/if/admin/  # → HTTP/2 403 (admin UI blocked on the public path)
+
+curl -sv https://mcp.mehrtens.com/mcp # → connection closed, no HTTP response (not an Anthropic IP)
 ```
 
 > A clean `200`/`302` on `auth.mehrtens.com/` also proves the PROXY-protocol pair
@@ -371,7 +397,7 @@ nodes self-prune). The `tag:vps-relay` data-plane ACL test still passes on save.
 | Reboot                | No                  | Same    | None               |
 | Manual `bootstrap.sh` | No                  | Same    | None               |
 | Rebuild (user-data)   | Yes                 | Same    | None               |
-| Delete + recreate     | Yes                 | **New** | Update `mc`/`photos`/`auth` records |
+| Delete + recreate     | Yes                 | **New** | Update `mc`/`photos`/`auth`/`mcp` records |
 
 ---
 
@@ -447,7 +473,43 @@ in a PROXY v2 header at L4, in front of the (still-encrypted) TLS bytes:
 This was validated empirically (`serve` carries an upstream PROXY header verbatim;
 confirmed end-to-end by a real client IP appearing in authentik's event log).
 
-### Adding a fourth SNI-routed HTTPS service
+## HTTPS services (iCloud MCP) — implemented
+
+`mcp.mehrtens.com` is a remote MCP server for Claude's custom connector, giving
+Claude read access to iCloud mail, calendar and contacts plus drafts and event
+edits (nothing can be sent or deleted). Claude calls connectors **from Anthropic's
+servers**, so it has to be public, but only to Anthropic's published outbound
+ranges. The server and gateway half lives in the hardened fork
+(`mcmehrtens/icloud-mcp`, see `HARDENED.md`); the relay half is here. As built:
+
+1. **VPS `traefik/mcp.yaml`:** the authentik pattern (passthrough + PROXY v2 emit
+   → `100.102.3.49:8445`) plus a TCP `ipAllowList` middleware on the router for
+   `160.79.104.0/21` and `153.61.208.0/20`, so everyone else is dropped at L4
+   before anything crosses the tailnet.
+2. **Tailnet ACL:** add `traefik-node:8445` to the `tag:vps-relay` grant; relay
+   test accepts `:8445`, still denies `traefik:443` / `nas:443` / `router:53`.
+3. **`relay-fw`:** no change — shares inbound TCP `443` (SNI-separated).
+4. **NAS side:** a scoped `public-mcp` entrypoint on `:8445` (same shape as
+   `public-auth`), the same allowlist again as an HTTP middleware on the real
+   client IP plus a rate limit, `tailscale serve --bg --tcp=8445
+   tcp://127.0.0.1:8445`, and the `icloud-mcp` TrueNAS app (agentgateway in front
+   of the iCloud server, which sits on an internal-only network).
+5. **Cloudflare:** `mcp` A + AAAA → VPS, grey cloud. No Unbound entries: only
+   Claude uses this name, so it resolves publicly everywhere.
+
+If Anthropic changes its outbound ranges, the connector fails closed: update the
+allowlist here **and** in the NAS `dynamic/mcp.yaml`.
+
+**Kill switches**
+
+| Action | Effect |
+| - | - |
+| Delete `traefik/mcp.yaml` here (pull on the box) | Public path closes immediately |
+| Revoke the `claude-mcp` app-specific password at account.apple.com | iCloud access ends immediately |
+| Stop the `icloud-mcp` TrueNAS app | Everything off |
+| Deactivate the `icloud-mcp` application in authentik | No new tokens; existing ones expire within 5 minutes |
+
+### Adding another SNI-routed HTTPS service
 
 Reuse the Immich pattern (no client IP) or the authentik pattern (with client
 IP): a new `HostSNI` passthrough router on the shared VPS `:443` entrypoint → a
